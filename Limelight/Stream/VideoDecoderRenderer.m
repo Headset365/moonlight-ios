@@ -143,13 +143,15 @@ extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
         else {
             _displayLink.preferredFramesPerSecond = self->frameRate;
         }
-        [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSDefaultRunLoopMode];
+        // Use the common modes so frame submission doesn't pause during UI tracking
+        [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     }
     else {
         // In lowest latency mode, we submit each frame to the decoder as soon as it
         // arrives rather than waiting for the next display link callback. Waiting for
         // the display link adds up to a full refresh interval of latency to every frame
-        // before decoding can even begin.
+        // before decoding can even begin. Submission happens directly on this thread,
+        // so the main thread (UI, input handling, stats overlay) can't delay frames.
         _frameWaitThread = [[NSThread alloc] initWithTarget:self selector:@selector(frameWaitThreadProc) object:nil];
         _frameWaitThread.name = @"Video frame wait";
         _frameWaitThread.qualityOfService = NSQualityOfServiceUserInteractive;
@@ -167,18 +169,7 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
     
     // LiWaitForNextVideoFrame() returns false when the stream is stopping
     while (!_stopping && LiWaitForNextVideoFrame(&handle, &du)) {
-        // Submission must happen on the main thread because it may recreate the
-        // display layer. We dispatch synchronously to preserve frame ordering and
-        // to apply backpressure to the frame queue if the main thread is busy.
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            if (self->_stopping) {
-                // Just free the frame if we're shutting down
-                LiCompleteVideoFrame(handle, DR_OK);
-            }
-            else {
-                LiCompleteVideoFrame(handle, DrSubmitDecodeUnit(du));
-            }
-        });
+        LiCompleteVideoFrame(handle, DrSubmitDecodeUnit(du));
     }
 }
 
@@ -216,7 +207,8 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
     
     if (_frameWaitThread != nil) {
         // Wake the frame wait thread so it can observe _stopping and exit.
-        // We don't join it here because it may be waiting on the main thread.
+        // We don't join it here because it may be waiting on the main thread
+        // to recreate the display layer.
         LiWakeWaitForVideoFrame();
         _frameWaitThread = nil;
     }
@@ -596,9 +588,15 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
     if (displayLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
         Log(LOG_E, @"Display layer rendering failed: %@", displayLayer.error);
         
-        // Recreate the display layer. We are already on the main thread,
-        // so this is safe to do right here.
-        [self reinitializeDisplayLayer];
+        // Recreate the display layer. Layer tree changes must happen on the main thread.
+        if ([NSThread isMainThread]) {
+            [self reinitializeDisplayLayer];
+        }
+        else {
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                [self reinitializeDisplayLayer];
+            });
+        }
         
         // Request an IDR frame to initialize the new decoder
         free(data);
@@ -628,9 +626,14 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
     // H.264 and HEVC formats require NAL prefix fixups from Annex B to length-delimited
     if (videoFormat & (VIDEO_FORMAT_MASK_H264 | VIDEO_FORMAT_MASK_H265)) {
         int lastOffset = -1;
-        for (int i = 0; i < length - NALU_START_PREFIX_SIZE; i++) {
-            // Search for a NALU
-            if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
+        int i = 0;
+        while (i < length - NALU_START_PREFIX_SIZE) {
+            if (data[i+2] > 1) {
+                // No start code can begin at i, i+1, or i+2 since a start code
+                // needs 0x00 in both of its first two bytes and 0x01 in its third.
+                i += 3;
+            }
+            else if (data[i+2] == 1 && data[i] == 0 && data[i+1] == 0) {
                 // It's the start of a new NALU
                 if (lastOffset != -1) {
                     // We've seen a start before this so enqueue that NALU
@@ -638,6 +641,10 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
                 }
                 
                 lastOffset = i;
+                i += NALU_START_PREFIX_SIZE;
+            }
+            else {
+                i++;
             }
         }
         
@@ -651,6 +658,8 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
         status = CMBlockBufferAppendBufferReference(frameBlockBuffer, dataBlockBuffer, 0, length, 0);
         if (status != noErr) {
             Log(LOG_E, @"CMBlockBufferAppendBufferReference failed: %d", (int)status);
+            CFRelease(dataBlockBuffer);
+            CFRelease(frameBlockBuffer);
             return DR_NEED_IDR;
         }
     }
@@ -681,11 +690,21 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
     [self->displayLayer enqueueSampleBuffer:sampleBuffer];
     
     if (du->frameType == FRAME_TYPE_IDR) {
-        // Ensure the layer is visible now
-        self->displayLayer.hidden = NO;
-        
-        // Tell our parent VC to hide the progress indicator
-        [self->_callbacks videoContentShown];
+        // UI updates must happen on the main thread. We don't need to wait for them.
+        AVSampleBufferDisplayLayer* layer = self->displayLayer;
+        dispatch_block_t showVideo = ^{
+            // Ensure the layer is visible now
+            layer.hidden = NO;
+            
+            // Tell our parent VC to hide the progress indicator
+            [self->_callbacks videoContentShown];
+        };
+        if ([NSThread isMainThread]) {
+            showVideo();
+        }
+        else {
+            dispatch_async(dispatch_get_main_queue(), showVideo);
+        }
     }
     
     // Dereference the buffers
