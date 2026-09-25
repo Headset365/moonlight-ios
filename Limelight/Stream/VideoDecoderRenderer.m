@@ -34,6 +34,8 @@ extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
     CMVideoFormatDescriptionRef formatDesc;
     
     CADisplayLink* _displayLink;
+    NSThread* _frameWaitThread;
+    volatile BOOL _stopping;
     BOOL framePacing;
 }
 
@@ -101,18 +103,55 @@ extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
 
 - (void)start
 {
-    _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayLinkCallback:)];
-    if (@available(iOS 15.0, tvOS 15.0, *)) {
-        _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(self->frameRate, self->frameRate, self->frameRate);
+    _stopping = NO;
+    
+    if (framePacing) {
+        // Frame pacing mode submits frames in lockstep with the display refresh
+        _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayLinkCallback:)];
+        if (@available(iOS 15.0, tvOS 15.0, *)) {
+            _displayLink.preferredFrameRateRange = CAFrameRateRangeMake(self->frameRate, self->frameRate, self->frameRate);
+        }
+        else {
+            _displayLink.preferredFramesPerSecond = self->frameRate;
+        }
+        [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSDefaultRunLoopMode];
     }
     else {
-        _displayLink.preferredFramesPerSecond = self->frameRate;
+        // In lowest latency mode, we submit each frame to the decoder as soon as it
+        // arrives rather than waiting for the next display link callback. Waiting for
+        // the display link adds up to a full refresh interval of latency to every frame
+        // before decoding can even begin.
+        _frameWaitThread = [[NSThread alloc] initWithTarget:self selector:@selector(frameWaitThreadProc) object:nil];
+        _frameWaitThread.name = @"Video frame wait";
+        _frameWaitThread.qualityOfService = NSQualityOfServiceUserInteractive;
+        [_frameWaitThread start];
     }
-    [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSDefaultRunLoopMode];
 }
 
 // TODO: Refactor this
 int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
+
+- (void)frameWaitThreadProc
+{
+    VIDEO_FRAME_HANDLE handle;
+    PDECODE_UNIT du;
+    
+    // LiWaitForNextVideoFrame() returns false when the stream is stopping
+    while (!_stopping && LiWaitForNextVideoFrame(&handle, &du)) {
+        // Submission must happen on the main thread because it may recreate the
+        // display layer. We dispatch synchronously to preserve frame ordering and
+        // to apply backpressure to the frame queue if the main thread is busy.
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            if (self->_stopping) {
+                // Just free the frame if we're shutting down
+                LiCompleteVideoFrame(handle, DR_OK);
+            }
+            else {
+                LiCompleteVideoFrame(handle, DrSubmitDecodeUnit(du));
+            }
+        });
+    }
+}
 
 - (void)displayLinkCallback:(CADisplayLink *)sender
 {
@@ -142,7 +181,16 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
 
 - (void)stop
 {
+    _stopping = YES;
+    
     [_displayLink invalidate];
+    
+    if (_frameWaitThread != nil) {
+        // Wake the frame wait thread so it can observe _stopping and exit.
+        // We don't join it here because it may be waiting on the main thread.
+        LiWakeWaitForVideoFrame();
+        _frameWaitThread = nil;
+    }
 }
 
 #define NALU_START_PREFIX_SIZE 3
@@ -594,6 +642,17 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
         return DR_NEED_IDR;
     }
 
+    if (!framePacing) {
+        // In lowest latency mode, tell the display layer to show this frame as soon as it is
+        // decoded. Without a control timebase, the layer otherwise schedules the frame by
+        // interpreting the host PC's PTS against the local host clock, which is unrelated.
+        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, YES);
+        if (attachments != NULL && CFArrayGetCount(attachments) > 0) {
+            CFMutableDictionaryRef dict = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+            CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+        }
+    }
+    
     // Enqueue the next frame
     [self->displayLayer enqueueSampleBuffer:sampleBuffer];
     
