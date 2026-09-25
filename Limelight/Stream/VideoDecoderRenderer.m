@@ -60,6 +60,35 @@ extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
     displayLayer.position = CGPointMake(CGRectGetMidX(_view.bounds), CGRectGetMidY(_view.bounds));
     displayLayer.bounds = CGRectMake(0, 0, videoSize.width, videoSize.height);
     displayLayer.videoGravity = AVLayerVideoGravityResize;
+    
+    if (!framePacing) {
+        // In lowest latency mode, drive the layer with a timebase that tracks the host clock.
+        // Each frame is stamped with its local arrival time (see submitDecodeBuffer), so the
+        // newest decoded frame is always the one that's due. Without this, the layer shows
+        // every frame in sequence and never skips a stale one, so any burst of frames or a
+        // stream frame rate slightly above the display refresh rate builds a permanent
+        // backlog of queued frames inside the layer.
+        CMTimebaseRef timebase = NULL;
+        OSStatus status;
+        if (@available(iOS 15.0, tvOS 15.0, *)) {
+            status = CMTimebaseCreateWithSourceClock(kCFAllocatorDefault, CMClockGetHostTimeClock(), &timebase);
+        }
+        else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            status = CMTimebaseCreateWithMasterClock(kCFAllocatorDefault, CMClockGetHostTimeClock(), &timebase);
+#pragma clang diagnostic pop
+        }
+        if (status == noErr) {
+            CMTimebaseSetTime(timebase, CMClockGetTime(CMClockGetHostTimeClock()));
+            CMTimebaseSetRate(timebase, 1.0);
+            displayLayer.controlTimebase = timebase;
+            CFRelease(timebase);
+        }
+        else {
+            Log(LOG_E, @"Failed to create display layer timebase: %d", (int)status);
+        }
+    }
 
     // Hide the layer until we get an IDR frame. This ensures we
     // can see the loading progress label as the stream is starting.
@@ -629,6 +658,12 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
     CMSampleBufferRef sampleBuffer;
     
     CMSampleTimingInfo sampleTiming = {kCMTimeInvalid, CMTimeMake(du->presentationTimeMs, 1000), kCMTimeInvalid};
+    if (!framePacing) {
+        // Stamp the frame with the current host time which our control timebase follows,
+        // so the frame is due as soon as it is decoded. The host PC's PTS is in an
+        // unrelated time domain and can't be compared against the local clock.
+        sampleTiming.presentationTimeStamp = CMClockGetTime(CMClockGetHostTimeClock());
+    }
     
     status = CMSampleBufferCreateReady(kCFAllocatorDefault,
                                   frameBlockBuffer,
@@ -642,17 +677,6 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit);
         return DR_NEED_IDR;
     }
 
-    if (!framePacing) {
-        // In lowest latency mode, tell the display layer to show this frame as soon as it is
-        // decoded. Without a control timebase, the layer otherwise schedules the frame by
-        // interpreting the host PC's PTS against the local host clock, which is unrelated.
-        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, YES);
-        if (attachments != NULL && CFArrayGetCount(attachments) > 0) {
-            CFMutableDictionaryRef dict = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
-            CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
-        }
-    }
-    
     // Enqueue the next frame
     [self->displayLayer enqueueSampleBuffer:sampleBuffer];
     
